@@ -1,0 +1,19 @@
+{
+    "compilerOptions": {
+        "types": ["bun-types", "node"],
+        "strict": true,
+        "noImplicitAny": true,
+        "target": "ES2022",
+        "module": "ESNext",
+        "moduleResolution": "bundler",
+        "lib": ["ES2023", "DOM"]
+        // 2. Mendefinisikan alias-aliasnya
+        // "baseUrl": ".",
+        // "paths": {
+        // "@src/*": ["src/*"],
+        // "@modules/*": ["src/modules/*"]
+        // "@db/*": ["src/db/*"]
+        // }
+    },
+    "include": ["src"]
+}

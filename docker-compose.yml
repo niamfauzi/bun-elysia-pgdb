@@ -1,0 +1,29 @@
+name: bun-elysia-project
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bun-elysia-project:dev
+    container_name: bun-elysia-project
+    working_dir: /app
+    environment:
+      # - NODE_ENV=development
+      - PORT=41102
+    ports:
+      - "41102:41102"
+    volumes:
+      # Mount seluruh kode supaya gampang di-edit pakai VS Code
+      - ./:/app
+      # Simpan cache bun & node_modules di volume terpisah biar cepat & stabil
+      - bun-cache:/root/.bun
+    # Install deps tiap start (ke volume node_modules), lalu hot reload
+    command: sh -c "bun install && bun run dev"
+    # Jika perlu memaksa arsitektur tertentu, bisa aktifkan:
+    # platform: linux/amd64
+    restart: "no"
+
+volumes:
+  bun-cache:
+  node_modules:
