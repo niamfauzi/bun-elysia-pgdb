@@ -1,357 +1,175 @@
-## Studi kasus
+## CHANGELOG
 
-Kamu punya API (Bun + Elysia) dengan modul **Orders**. Endpoint `POST` di Orders rawan “spam” (mis.
-create order berulang, cancel/pay berulang) sehingga perlu **rate limit**:
+Mengikuti _Keep a Changelog_ + _Semantic Versioning_.
 
-- **Aturan:** 3 request / 10 detik **per client** (berdasarkan IP)
-- **Wajib konsisten lintas instance** (multi process / multi server) → harus pakai **Redis**, bukan
-  memory
-- Saat limit terlewati, API mengembalikan **429 Too Many Requests** + header:
-  - `x-ratelimit-limit`
-  - `x-ratelimit-remaining`
-  - `x-ratelimit-reset`
-  - `retry-after`
+### [Unreleased]
 
-Di Elysia, implementasinya idealnya sebagai **plugin** (hook `onBeforeHandle`) yang ditempel ke
-**group routes** untuk semua `POST /orders*`. Perlu perhatian khusus:
+#### Added
 
-- **Scope lifecycle hook** (`local / scoped / global`) agar plugin benar-benar “membungkus” route
-  yang kamu maksud. ([elysiajs.com][1])
-- **Deduplication plugin**: Elysia bisa “menganggap plugin sama” berdasarkan `name` (+ `seed`),
-  sehingga konfigurasi berbeda bisa ketiban bila `name` tidak unik. ([elysiajs.com][2])
+- (Planned) Rate limiting di **edge/gateway** (WAF/Ingress/API Gateway) sebagai proteksi awal
+  sebelum aplikasi.
+
+#### Changed
+
+- (Planned) Upgrade algoritma dari **fixed-window counter** ke **token bucket/sliding window** untuk
+  kontrol burst yang lebih halus.
 
 ---
-
-# CHANGELOG — v1.8.0
-
-Mengikuti format _Keep a Changelog_.
 
 ## [1.8.0] — 2026-01-21
 
 ### Added
 
-- Rate limiting berbasis Redis untuk semua endpoint `POST` pada modul Orders (`/orders`,
-  `/orders/:id/cancel`, `/orders/:id/pay`).
-- Response header rate limit:
+- Rate limiting berbasis Redis untuk semua endpoint `POST` pada modul Orders:
+  - `POST /orders`
+  - `POST /orders/:id/cancel`
+  - `POST /orders/:id/pay`
+
+- Header rate limit:
   - `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-reset`, `retry-after`
 
-- Konfigurasi env untuk Redis (`REDIS_URL`) dan toggle debug (`RL_DEBUG`).
+- Redis sebagai shared store agar rate limit konsisten lintas instance/multi server.
+- Toggle debug (`RL_DEBUG`) untuk membantu troubleshooting.
 
 ### Changed
 
-- Struktur routing Orders: pemisahan group `ordersPostRoutes` agar middleware rate limit hanya
-  menempel ke endpoint `POST` Orders.
-- Plugin rate limit menggunakan scope `scoped` untuk membungkus parent + descendant tanpa “bleed” ke
-  modul lain. ([elysiajs.com][1])
+- Orders routing dipecah menjadi group khusus `POST` (`ordersPostRoutes`) agar rate limit hanya
+  berlaku untuk endpoint mutasi.
+- Rate limit diimplementasikan sebagai plugin Elysia (`onBeforeHandle`) dan dipasang pada group
+  routes.
 
 ### Fixed
 
-- Deduplication plugin rate limit: `name` plugin dibuat unik per konfigurasi
-  (`prefix/limit/windowMs`) atau menggunakan `seed` agar konfigurasi tidak saling ketiban (contoh:
-  limit global 10 vs limit orders 3). ([elysiajs.com][2])
+- Menghindari konfigurasi rate limit yang saling “ketiban” (dedupe plugin) dengan membuat identitas
+  plugin unik per konfigurasi (`name` unik atau `seed`).
 
 ### Security
 
-- Mitigasi abuse/spam request pada endpoint sensitif (create/cancel/pay) dengan throttling per IP
-  berbasis Redis (shared store).
+- Mitigasi spam/abuse pada endpoint sensitif Orders (create/cancel/pay) dengan throttling per client
+  dan respons 429.
 
 ---
 
-# Step-by-step implementasi
+## Catatan standar industri yang perlu diperhatikan / diimplementasikan
 
-## 0) Prasyarat
+1. **Layered rate limiting**
+   - Edge/Gateway (disarankan) → Application (sudah) → Proteksi endpoint berat (opsional)
 
-1. Redis tersedia (local via docker-compose atau managed Redis).
-2. App bisa membaca env (`REDIS_URL`).
-3. Bun + Elysia sudah berjalan.
+2. **Identitas jangan cuma IP**
+   - Utamakan `tenantId/userId/apiKey`, fallback IP
 
----
+3. **Bucket stabil per endpoint**
+   - Jangan pecah key karena `:id` dinamis
 
-## 1) Struktur file yang disarankan
+4. **Algoritma**
+   - Fixed window sederhana tapi bisa burst; pertimbangkan token bucket/sliding window jika perlu
 
-```
-src/
-  infra/
-    rateLimitStore.ts
-  shared/
-    rate-limit/
-      index.ts
-      rateLimit.ts
-      store.redis.ts
-      types.ts
-  modules/
-    orders/
-      order.routes.ts
-  modules/
-    index.ts
-```
+5. **Failure mode Redis**
+   - Tentukan fail-open vs fail-close + timeout
+
+6. **Observability**
+   - Metric allowed/blocked, redis latency, error rate
+
+7. **Trust proxy**
+   - Pastikan XFF hanya dipercaya dari proxy trusted dan app tidak bisa diakses langsung
+
+8. **Allowlist/skip**
+   - internal/healthcheck/admin
 
 ---
 
-## 2) Definisikan tipe store + result
+# Step-by-step implementasi (yang sekarang digunakan)
 
-**`src/shared/rate-limit/types.ts`**
+> Target: semua `POST` di Orders kena limit **3 request / 10 detik** per client (IP), konsisten
+> lintas instance.
 
-```ts
-export type RateLimitResult = {
-  allowed: boolean;
-  remaining: number;
-  resetAt: number; // epoch ms
-};
+## Step 1 — Siapkan Redis & env
 
-export interface RateLimitStore {
-  consume(key: string, limit: number, windowMs: number): Promise<RateLimitResult>;
-}
+1. Jalankan Redis (local docker atau managed).
+2. Set env:
+   - `REDIS_URL=redis://localhost:6379`
+   - `RL_DEBUG=0` (ubah ke `1` saat debugging)
 
-export type RateLimitOptions = {
-  store: RateLimitStore;
-  limit: number;
-  windowMs: number;
-  prefix?: string;
-  keyGenerator?: (req: Request) => string;
-};
-```
+## Step 2 — Implement store Redis (RateLimitStore)
 
----
+1. Buat store Redis yang punya method:
+   - `consume(key, limit, windowMs) -> { allowed, remaining, resetAt }`
 
-## 3) Implement RateLimitStore Redis (Lua: INCR + PEXPIRE + PTTL)
+2. Gunakan Lua script agar operasi atomic:
+   - `INCR key`
+   - kalau `current == 1` → `PEXPIRE key windowMs`
+   - ambil `PTTL`
+   - return flag allowed + ttl
 
-**`src/shared/rate-limit/store.redis.ts`** (contoh)
+3. Hitung `remaining` dan `resetAt` di aplikasi:
+   - `remaining = max(limit - current, 0)`
+   - `resetAt = now + ttl`
 
-```ts
-import Redis from 'ioredis';
-import type { RateLimitStore, RateLimitResult } from './types';
+## Step 3 — Buat factory singleton Redis store
 
-const LUA = `
-local key = KEYS[1]
-local limit = tonumber(ARGV[1])
-local windowMs = tonumber(ARGV[2])
+1. Buat `getRateLimitStore()` agar koneksi Redis tidak dibuat berulang.
+2. `getRateLimitStore()` membaca `REDIS_URL`.
+3. Return store yang sama untuk semua module.
 
-local current = redis.call("INCR", key)
-if current == 1 then
-  redis.call("PEXPIRE", key, windowMs)
-end
+## Step 4 — Implement plugin `rateLimit(opts)` di Elysia
 
-local ttl = redis.call("PTTL", key)
-if ttl < 0 then ttl = windowMs end
+1. Buat plugin Elysia yang memasang hook `onBeforeHandle`.
+2. Di hook:
+   - Ambil method + path untuk logging.
+   - Ambil client identity (default: IP via `x-forwarded-for` lalu `x-real-ip`, fallback `unknown`).
+   - Bentuk key Redis: `prefix:keyGen(request)`
+   - Panggil `opts.store.consume(...)`.
 
-if current > limit then
-  return {0, current, ttl}
-else
-  return {1, current, ttl}
-end
-`;
+3. Pasang header rate limit:
+   - `x-ratelimit-limit`
+   - `x-ratelimit-remaining`
+   - `x-ratelimit-reset`
+   - jika blocked → `retry-after`
 
-export class RedisRateLimitStore implements RateLimitStore {
-  constructor(private redis: Redis) {}
+4. Jika `allowed == false`, throw error 429 (`tooManyRequests`).
+5. **Penting**:
+   - Pakai scope yang tepat agar membungkus group route (`scoped` direkomendasikan).
+   - Hindari dedupe plugin dengan identitas unik per konfigurasi (`name` unik atau `seed`).
 
-  async consume(key: string, limit: number, windowMs: number): Promise<RateLimitResult> {
-    const [allowedFlag, current, ttl] = (await this.redis.eval(
-      LUA,
-      1,
-      key,
-      String(limit),
-      String(windowMs),
-    )) as [number, number, number];
+## Step 5 — Integrasi ke Orders (group khusus POST)
 
-    const allowed = allowedFlag === 1;
-    const remaining = Math.max(limit - current, 0);
-    const resetAt = Date.now() + ttl;
-
-    return { allowed, remaining, resetAt };
-  }
-}
-```
+1. Buat group routes khusus POST Orders.
+2. Tempel plugin rateLimit di group itu:
+   - `limit: 3`
+   - `windowMs: 10_000`
+   - `prefix: 'rl:orders:post'`
 
----
+3. Definisikan semua POST Orders di group tersebut:
+   - `/orders`
+   - `/orders/:id/cancel`
+   - `/orders/:id/pay`
 
-## 4) Factory `getRateLimitStore()` (shared instance Redis)
-
-**`src/infra/rateLimitStore.ts`**
+4. Export module Orders dan `.use(ordersPostRoutes)` di module utama Orders.
 
-```ts
-import Redis from 'ioredis';
-import { RedisRateLimitStore } from '../shared/rate-limit/store.redis';
+## Step 6 — Daftarkan Orders module ke root modules/app
 
-let singleton: RedisRateLimitStore | null = null;
+1. Pastikan module Orders di-use oleh `src/modules/index.ts` atau entrypoint app.
+2. Jalankan app dan pastikan routes aktif.
 
-export function getRateLimitStore() {
-  if (singleton) return singleton;
+## Step 7 — Testing manual (wajib)
 
-  const redisUrl = process.env.REDIS_URL;
-  if (!redisUrl) throw new Error('REDIS_URL is required for rate limiting');
+1. Panggil `POST /orders/:id/cancel` 4x dalam 10 detik:
+   - request 1–3: sukses
+   - request 4: 429
 
-  const redis = new Redis(redisUrl);
-  singleton = new RedisRateLimitStore(redis);
-  return singleton;
-}
-```
-
----
-
-## 5) Plugin Elysia `rateLimit()` (scope + anti-dedupe + headers + 429)
-
-**Poin penting:**
-
-- Gunakan **`scoped`** agar plugin membungkus parent (group routes) + descendants.
-  ([elysiajs.com][1])
-- Buat **`name` unik** (atau gunakan `seed`) agar konfigurasi tidak ketiban dedupe.
-  ([elysiajs.com][2])
-
-**`src/shared/rate-limit/rateLimit.ts`**
-
-```ts
-import { Elysia } from 'elysia';
-import { tooManyRequests } from '../http/errors';
-import type { RateLimitOptions } from './types';
-
-const RL_DEBUG = process.env.RL_DEBUG === '1';
-const rlLog = (...args: any[]) => RL_DEBUG && console.log(...args);
-
-function getClientIp(req: Request) {
-  const xff = req.headers.get('x-forwarded-for');
-  if (xff) return xff.split(',')[0].trim();
-  return req.headers.get('x-real-ip') ?? 'unknown';
-}
-
-export function rateLimit(opts: RateLimitOptions) {
-  const prefix = opts.prefix ?? 'rl';
-  const keyGen = opts.keyGenerator ?? ((req) => `ip:${getClientIp(req)}`);
+2. Periksa header:
+   - `x-ratelimit-limit` harus `3`
+   - `retry-after` muncul saat 429
 
-  // ✅ anti-dedupe: unik per konfigurasi
-  const pluginName = `rate-limit:${prefix}:${opts.limit}:${opts.windowMs}`;
+## Step 8 — Debugging cepat (saat tembus)
 
-  rlLog('[RL:init]', { pluginName, prefix, limit: opts.limit, windowMs: opts.windowMs });
+1. Nyalakan debug: `RL_DEBUG=1`
+2. Pastikan log muncul untuk endpoint yang dites:
+   - `[RL:init]` (plugin kepasang)
+   - `[RL:req]` (hook kepanggil)
+   - `[RL:res]` (remaining turun)
+   - `[RL:block]` (429 saat limit lewat)
 
-  return new Elysia({ name: pluginName }).onBeforeHandle(
-    { as: 'scoped' }, // ✅ scope benar untuk group routes :contentReference[oaicite:6]{index=6}
-    async ({ request, set }) => {
-      const path = new URL(request.url).pathname;
-      const key = `${prefix}:${keyGen(request)}`;
-
-      const r = await opts.store.consume(key, opts.limit, opts.windowMs);
-
-      rlLog('[RL:req]', { method: request.method, path, key });
-      rlLog('[RL:res]', {
-        allowed: r.allowed,
-        remaining: r.remaining,
-        resetAt: r.resetAt,
-        resetInMs: r.resetAt - Date.now(),
-      });
-
-      set.headers['x-ratelimit-limit'] = String(opts.limit);
-      set.headers['x-ratelimit-remaining'] = String(r.remaining);
-      set.headers['x-ratelimit-reset'] = String(Math.floor(r.resetAt / 1000));
-
-      if (!r.allowed) {
-        const retryAfterSec = Math.max(Math.ceil((r.resetAt - Date.now()) / 1000), 1);
-        set.headers['retry-after'] = String(retryAfterSec);
-
-        rlLog('[RL:block]', { path, key, retryAfterSec });
-
-        throw tooManyRequests('Rate limit exceeded', {
-          limit: opts.limit,
-          windowMs: opts.windowMs,
-          retryAfterSec,
-        });
-      }
-    },
-  );
-}
-```
-
-**`src/shared/rate-limit/index.ts`**
-
-```ts
-export * from './rateLimit';
-export * from './types';
-```
-
----
-
-## 6) Integrasi ke Orders: group semua POST Orders
-
-**`src/modules/orders/order.routes.ts`** (inti)
-
-```ts
-import { Elysia } from 'elysia';
-import { rateLimit } from '../../shared/rate-limit';
-import { getRateLimitStore } from '../../infra/rateLimitStore';
-
-const ordersPostRoutes = new Elysia({ name: 'orders-post-routes' })
-  .use(
-    rateLimit({
-      store: getRateLimitStore(),
-      limit: 3,
-      windowMs: 10_000,
-      prefix: 'rl:orders:post',
-    }),
-  )
-  .post('/orders' /* ... */)
-  .post('/orders/:id/cancel' /* ... */)
-  .post('/orders/:id/pay' /* ... */);
-
-export const ordersModule = new Elysia({ name: 'orders-module' })
-  .use(ordersPostRoutes)
-  .get('/orders' /* ... */)
-  .get('/orders/cursor' /* ... */)
-  .get('/orders/:id' /* ... */)
-  .get('/orders/:id/query' /* ... */);
-```
-
----
-
-## 7) Daftarkan module di root modules
-
-**`src/modules/index.ts`**
-
-```ts
-import { Elysia } from 'elysia';
-import { ordersModule } from './orders/order.routes';
-
-export const modules = new Elysia().use(ordersModule);
-```
-
----
-
-## 8) Konfigurasi env
-
-**`.env`**
-
-```bash
-REDIS_URL=redis://localhost:6379
-RL_DEBUG=0
-```
-
----
-
-## 9) Testing manual (curl)
-
-Hit 4 kali dalam 10 detik:
-
-```bash
-curl -i -X POST http://localhost:3000/orders/123/cancel
-```
-
-Ekspektasi:
-
-- 1–3: status 200, header remaining turun
-- ke-4: **429**, ada `retry-after`
-
----
-
-## 10) Debug checklist kalau “tembus”
-
-1. **Deduplication ketiban** (limit masih 10 padahal harus 3) → pastikan `pluginName` unik atau
-   pakai `seed`. ([elysiajs.com][2])
-2. **Scope hook salah** → gunakan `scoped` untuk group routes. ([elysiajs.com][1])
-3. **IP tidak stabil** (`unknown` atau berubah) → cek `x-forwarded-for` / `x-real-ip` di reverse
-   proxy.
-4. **Store tidak shared** → pastikan semua instance pakai Redis yang sama (bukan memory).
-5. **Key generator salah** → pastikan key tidak berubah tiap request.
-
-Kalau kamu mau, kirim output log `[RL:init]` + 4 request `[RL:req]/[RL:res]` dari endpoint cancel,
-nanti aku bantu bacakan alurnya dan tunjukkan titik masalahnya.
-
-[1]: https://elysiajs.com/essential/plugin?utm_source=chatgpt.com 'Plugin'
-[2]: https://elysiajs.com/key-concept?utm_source=chatgpt.com 'Key Concept MUST READ'
+3. Jika limit masih “10”, cek dedupe plugin (name/seed).
+4. Jika remaining tidak turun, cek IP/key berubah-ubah (XFF/Real-IP/proxy).
+5. Jika aplikasi multi worker, pastikan store benar-benar Redis shared (bukan memory).
