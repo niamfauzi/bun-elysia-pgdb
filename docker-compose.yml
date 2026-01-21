@@ -8,22 +8,26 @@ services:
     image: bun-elysia-project:dev
     container_name: bun-elysia-project
     working_dir: /app
+
+    env_file:
+      - .env
     environment:
-      # - NODE_ENV=development
-      - PORT=41102
+      - PORT=${PORT:-41102}
+
     ports:
-      - "41102:41102"
+      - '${PORT:-41102}:${PORT:-41102}'
+
     volumes:
-      # Mount seluruh kode supaya gampang di-edit pakai VS Code
+      # Mount seluruh project (TERMASUK node_modules) supaya sinkron & kebaca VS Code
       - ./:/app
-      # Simpan cache bun & node_modules di volume terpisah biar cepat & stabil
+
+      # Cache bun (opsional, untuk mempercepat install bila kamu tetap install di container)
       - bun-cache:/root/.bun
-    # Install deps tiap start (ke volume node_modules), lalu hot reload
-    command: sh -c "bun install && bun run dev"
-    # Jika perlu memaksa arsitektur tertentu, bisa aktifkan:
-    # platform: linux/amd64
-    restart: "no"
+
+    # Jalankan dev saja; dependency diharapkan sudah ter-install di host
+    command: sh -c "bun run dev"
+
+    restart: 'no'
 
 volumes:
   bun-cache:
-  node_modules:

@@ -16,10 +16,23 @@ import {
   CancelOrderResponse,
 } from './order.schema';
 
+// ✅ add
+import { rateLimit } from '../../shared/rate-limit';
+import { getRateLimitStore } from '../../infra/rateLimitStore';
+
 const repo = new OrderRepository(db);
 const service = new OrderService(repo);
 
-export const ordersModule = new Elysia({ name: 'orders-module' })
+// ✅ semua POST orders kena limit 3 req / 10 detik
+const ordersPostRoutes = new Elysia({ name: 'orders-post-routes' })
+  .use(
+    rateLimit({
+      store: getRateLimitStore(),
+      limit: 3,
+      windowMs: 10_000,
+      prefix: 'rl:orders:post',
+    }),
+  )
   .post(
     '/orders',
     async ({ body, set }) => {
@@ -29,8 +42,20 @@ export const ordersModule = new Elysia({ name: 'orders-module' })
     },
     { body: CreateOrderBody, response: { 201: CreateOrderResponse } },
   )
+  .post(
+    '/orders/:id/cancel',
+    async ({ params }) => ({ data: await service.cancelOrder(params.id) }),
+    { params: OrderIdParams, response: { 200: CancelOrderResponse } },
+  )
+  .post(
+    '/orders/:id/pay',
+    async ({ params, body }) => ({ data: await service.payOrder(params.id, body) }),
+    { params: OrderIdParams, body: PayOrderBody, response: { 200: PayOrderResponse } },
+  );
 
-  // ✅ Offset pagination (existing), sekarang support date range + includeItems
+export const ordersModule = new Elysia({ name: 'orders-module' })
+  .use(ordersPostRoutes)
+
   .get(
     '/orders',
     async ({ query }) => {
@@ -50,7 +75,6 @@ export const ordersModule = new Elysia({ name: 'orders-module' })
     { query: ListOrdersQuery, response: { 200: ListOrdersResponse } },
   )
 
-  // ✅ Cursor pagination (endpoint baru untuk perbandingan)
   .get(
     '/orders/cursor',
     async ({ query }) => {
@@ -69,34 +93,13 @@ export const ordersModule = new Elysia({ name: 'orders-module' })
     { query: ListOrdersCursorQuery, response: { 200: ListOrdersCursorResponse } },
   )
 
-  // ✅ NEW: Query API version (comparison)
   .get(
     '/orders/:id/query',
     async ({ params }) => ({ data: await service.getOrderDetailQueryApi(params.id) }),
     { params: OrderIdParams, response: { 200: GetOrderDetailResponse } },
   )
 
-  // existing:
   .get('/orders/:id', async ({ params }) => ({ data: await service.getOrderDetail(params.id) }), {
     params: OrderIdParams,
     response: { 200: GetOrderDetailResponse },
-  })
-
-  .post(
-    '/orders/:id/cancel',
-    async ({ params }) => ({ data: await service.cancelOrder(params.id) }),
-    { params: OrderIdParams, response: { 200: CancelOrderResponse } },
-  )
-
-  .post(
-    '/orders/:id/pay',
-    async ({ params, body }) => {
-      const result = await service.payOrder(params.id, body);
-      return { data: result };
-    },
-    {
-      params: OrderIdParams,
-      body: PayOrderBody,
-      response: { 200: PayOrderResponse },
-    },
-  );
+  });
